@@ -11,6 +11,7 @@
 #include <boost/optional.hpp>
 #include <boost/utility/string_view.hpp>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -61,6 +62,29 @@ namespace savanna
 			virtual void on_read_l(beast::error_code ec, std::size_t bytes_transferred) = 0;
 			virtual void on_shutdown_l(beast::error_code ec) = 0;
 			virtual void on_close_l(beast::error_code ec) = 0;
+
+			// Set when this side has issued async_close. Only touched on the stream's
+			// executor (the io thread), so a second close() is a no-op instead of a
+			// second close operation on the same stream.
+			bool close_requested_ = false;
+
+			// Issue async_close on the stream's executor. The stream is not thread-safe
+			// and close() may be called from any thread, so the close always runs on the
+			// io thread, and at most once.
+			template <class Stream>
+			void post_close(const std::shared_ptr<Stream> &stream)
+			{
+				auto self = shared_from_this();
+				net::post(stream->get_executor(), [this, self, stream]() {
+					if (close_requested_ || !stream->is_open()) {
+						return;
+					}
+					close_requested_ = true;
+					stream->async_close(
+					    beast::websocket::close_code::normal,
+					    beast::bind_front_handler(&interface::on_close, self));
+				});
+			}
 
 		public:
 			virtual ~interface() = default;
@@ -230,12 +254,7 @@ namespace savanna
 			}
 			void close() override
 			{
-				if(!raw_stream_->is_open()) return;
-				raw_stream_->async_close(
-				    beast::websocket::close_code::normal,
-				    beast::bind_front_handler(
-				        &interface::on_close,
-				        shared_from_this()));
+				post_close(raw_stream_);
 			}
 		};
 
@@ -284,6 +303,9 @@ namespace savanna
 			void on_ssl_handshake_l(beast::error_code ec) override
 			{
 				beast::get_lowest_layer(*ssl_stream_).expires_never();
+				// Same as the raw stream: bounds the WebSocket handshake and the close
+				// handshake. Without it a close on a dead link never completes.
+				ssl_stream_->set_option(beast::websocket::stream_base::timeout::suggested(beast::role_type::client));
 				ssl_stream_->set_option(beast::websocket::stream_base::decorator([](beast::websocket::request_type &req) {
 					req.set(http::field::user_agent, std::string(BOOST_BEAST_VERSION_STRING) + " savanna");
 				}));
@@ -368,12 +390,7 @@ namespace savanna
 			}
 			void close() override
 			{
-				if(!ssl_stream_->is_open()) return
-				ssl_stream_->async_close(
-					beast::websocket::close_code::normal,
-					beast::bind_front_handler(
-						&interface::on_close,
-						shared_from_this()));
+				post_close(ssl_stream_);
 			}
 		};
 
@@ -390,6 +407,8 @@ namespace savanna
 			boost::optional<std::function<void(beast::flat_buffer &)>> on_message_handler_;
 			T stream_;
 			state current_state_ = unknown;
+			// Set by close(), which may run on any thread; read on the io thread.
+			std::atomic<bool> closing_ { false };
 
 			std::map<std::string, std::shared_ptr<SSL_SESSION>> *ssl_cache_;
 
@@ -405,10 +424,32 @@ namespace savanna
 				interface_ = std::make_shared<ssl_stream_logic>(stream, this, resolver_, ssl_cache_);
 			}
 
+			// After close() the pending read (and any queued write) completes with
+			// operation_aborted or websocket::error::closed, or with beast::error::timeout
+			// when the peer does not answer the close in time (the socket is closed then).
+			// That is the end of a close this side asked for, not an error: report
+			// `closed` and let run() return.
+			bool ended_by_own_close(beast::error_code ec)
+			{
+				if (!closing_) {
+					return false;
+				}
+				if (ec != net::error::operation_aborted && ec != beast::websocket::error::closed && ec != beast::error::timeout) {
+					return false;
+				}
+				if (current_state_ != closed) {
+					set_current_state(closed);
+				}
+				return true;
+			}
+
 			void on_write(beast::error_code ec, std::size_t bytes_transferred) override
 			{
 				boost::ignore_unused(bytes_transferred);
 				if (ec) {
+					if (ended_by_own_close(ec)) {
+						return;
+					}
 					on_error(ec);
 					return;
 				}
@@ -419,6 +460,9 @@ namespace savanna
 				boost::ignore_unused(bytes_transferred);
 
 				if (ec) {
+					if (ended_by_own_close(ec)) {
+						return;
+					}
 					on_error(ec);
 					return;
 				}
@@ -485,9 +529,20 @@ namespace savanna
 				interface_->write(data);
 			}
 
+			// Asks the io thread to close the connection; safe to call from any thread and
+			// more than once. Returns false when run() has not created the stream logic yet.
+			// true only means the request was posted: if the stream is not open (still
+			// connecting, or already closed) the close is a no-op.
+			// When the close completes, the state becomes `closed` and run() returns
+			// without throwing.
 			bool close()
 			{
+				if (!interface_) {
+					return false;
+				}
+				closing_ = true;
 				interface_->close();
+				return true;
 			}
 
 			void on_message(std::function<void(beast::flat_buffer &)> handler)
