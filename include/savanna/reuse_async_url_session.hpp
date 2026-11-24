@@ -110,9 +110,13 @@ namespace ssl_reuse
 		beast::flat_buffer buffer_;
 		http::response<Body> response_;
 		http::request<http::string_body> request_;
+		// Set right before the request starts to be written (see result::request_sent).
+		bool request_written_ = false;
 	protected:
 		void error_callback(beast::error_code ec) override {
-			if(delegate_) delegate_->completion_callback(savanna::result<http::response<Body>>(beast::system_error { ec }));
+			savanna::result<http::response<Body>> result(beast::system_error { ec });
+			result.request_sent = request_written_;
+			if(delegate_) delegate_->completion_callback(std::move(result));
 		}
 		void on_resolve_l(beast::error_code ec, tcp::resolver::results_type results) override {
 			tcp_stream_->expires_after(timeout_interval_);
@@ -121,6 +125,7 @@ namespace ssl_reuse
 
 		void on_connect_l(beast::error_code ec, tcp::resolver::results_type::endpoint_type) override {
 			tcp_stream_->expires_after(timeout_interval_);
+			request_written_ = true;
 			http::async_write(*tcp_stream_, request_, beast::bind_front_handler(&http_logic<Body>::on_write, this->shared_from_this()));
 		}
 		void on_handshake_l(beast::error_code ec) override { }
@@ -136,7 +141,9 @@ namespace ssl_reuse
 			if (ec && ec != beast::errc::not_connected) {
 				error_callback(ec);
 			}else {
-				if(delegate_) delegate_->completion_callback(savanna::result<http::response<Body>>(std::move(response_)));
+				savanna::result<http::response<Body>> result(std::move(response_));
+				result.request_sent = true;
+				if(delegate_) delegate_->completion_callback(std::move(result));
 			}
 		}
 
@@ -175,9 +182,12 @@ namespace ssl_reuse
 		// Set once the result of the request has been handed to the delegate. After that
 		// only the TLS close (close_notify) is left, and it is not part of the result.
 		bool delivered_ = false;
+		// Set right before the request starts to be written (see result::request_sent).
+		bool request_written_ = false;
 		// How long to wait for the peer's close_notify after the response. Nothing needs
-		// it, but run() does not return until the shutdown ends.
-		static constexpr std::chrono::seconds shutdown_timeout_{1};
+		// it, but run() does not return until the shutdown ends. (A function rather than a
+		// static constexpr member, so C++11/14 users need no out-of-class definition.)
+		static std::chrono::seconds shutdown_timeout() { return std::chrono::seconds(1); }
 	protected:
 		void error_callback(beast::error_code ec) override {
 			// An error while closing the TLS session after the result was delivered (peer
@@ -185,7 +195,9 @@ namespace ssl_reuse
 			if (delivered_) {
 				return;
 			}
-			if(delegate_) delegate_->completion_callback(savanna::result<http::response<Body>>(beast::system_error { ec }));
+			savanna::result<http::response<Body>> result(beast::system_error { ec });
+			result.request_sent = request_written_;
+			if(delegate_) delegate_->completion_callback(std::move(result));
 		}
 		void on_resolve_l(beast::error_code ec, tcp::resolver::results_type results) override {
 			if (!SSL_set_tlsext_host_name(ssl_stream_->native_handle(), host_.c_str())) {
@@ -230,6 +242,7 @@ namespace ssl_reuse
 			// Set a timeout on the operation
 			beast::get_lowest_layer(*ssl_stream_).expires_after(timeout_interval_);
 			// Send the HTTP request to the remote host
+			request_written_ = true;
 			http::async_write(*ssl_stream_, request_, beast::bind_front_handler(&https_logic<Body>::on_write, this->shared_from_this()));
 		}
 
@@ -242,7 +255,9 @@ namespace ssl_reuse
 				error_callback(ec);
 			}
 			else {
-				if(delegate_) unfollow = delegate_->completion_callback(savanna::result<http::response<Body>>(std::move(response_)));
+				savanna::result<http::response<Body>> result(std::move(response_));
+				result.request_sent = true;
+				if(delegate_) unfollow = delegate_->completion_callback(std::move(result));
 			}
 			if(unfollow){
 				delivered_ = true;
@@ -250,7 +265,7 @@ namespace ssl_reuse
 				// peer that neither answers close_notify nor closes the connection keeps run()
 				// blocked until the request timeout. close_notify is still sent first, so the
 				// session stays resumable.
-				beast::get_lowest_layer(*ssl_stream_).expires_after(shutdown_timeout_);
+				beast::get_lowest_layer(*ssl_stream_).expires_after(shutdown_timeout());
 				ssl_stream_->async_shutdown(beast::bind_front_handler(&https_logic<Body>::on_shutdown,this->shared_from_this()));
 			}
 		}
@@ -295,6 +310,9 @@ namespace ssl_reuse
 		bool isReady_ = true;
 
 		bool follow_location_ = false;
+		// A redirect was followed: the original request already reached a server, so any
+		// later result counts as sent even if the next leg fails before writing.
+		bool redirected_ = false;
 
 		std::string current_scheme()
 		{
@@ -338,8 +356,12 @@ namespace ssl_reuse
 		};
 
 		bool completion_callback(savanna::result<http::response<http::dynamic_body>> result) override {
+			if (redirected_) {
+				result.request_sent = true;
+			}
 			if (!result.error) {
 				if ((result.response->result_int() >= 300) && result.response->result_int() < 400 && follow_location_) {
+					redirected_ = true;
 					auto location = result.response->base()["Location"].to_string();
 					auto new_url = savanna::url(location);
 					update_request(original_request_, new_url.to_string(), new_url.host());
