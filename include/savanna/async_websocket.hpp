@@ -368,7 +368,7 @@ namespace savanna
 			}
 			void close() override
 			{
-				if(!ssl_stream_->is_open()) return
+				if(!ssl_stream_->is_open()) return;
 				ssl_stream_->async_close(
 					beast::websocket::close_code::normal,
 					beast::bind_front_handler(
@@ -485,9 +485,15 @@ namespace savanna
 				interface_->write(data);
 			}
 
+			// Returns false when there is no connection to close yet
+			// (run() has not created the stream logic).
 			bool close()
 			{
+				if (!interface_) {
+					return false;
+				}
 				interface_->close();
+				return true;
 			}
 
 			void on_message(std::function<void(beast::flat_buffer &)> handler)
