@@ -172,8 +172,19 @@ namespace ssl_reuse
 		std::string host_;
 		std::map<std::string, std::shared_ptr<SSL_SESSION>>* ssl_cache_;
 		std::string ipaddress_;
+		// Set once the result of the request has been handed to the delegate. After that
+		// only the TLS close (close_notify) is left, and it is not part of the result.
+		bool delivered_ = false;
+		// How long to wait for the peer's close_notify after the response. Nothing needs
+		// it, but run() does not return until the shutdown ends.
+		static constexpr std::chrono::seconds shutdown_timeout_{1};
 	protected:
 		void error_callback(beast::error_code ec) override {
+			// An error while closing the TLS session after the result was delivered (peer
+			// reset, shutdown timeout) must not reach the delegate as a second completion.
+			if (delivered_) {
+				return;
+			}
 			if(delegate_) delegate_->completion_callback(savanna::result<http::response<Body>>(beast::system_error { ec }));
 		}
 		void on_resolve_l(beast::error_code ec, tcp::resolver::results_type results) override {
@@ -234,6 +245,12 @@ namespace ssl_reuse
 				if(delegate_) unfollow = delegate_->completion_callback(savanna::result<http::response<Body>>(std::move(response_)));
 			}
 			if(unfollow){
+				delivered_ = true;
+				// The deadline set before the request is still running; without a new one a
+				// peer that neither answers close_notify nor closes the connection keeps run()
+				// blocked until the request timeout. close_notify is still sent first, so the
+				// session stays resumable.
+				beast::get_lowest_layer(*ssl_stream_).expires_after(shutdown_timeout_);
 				ssl_stream_->async_shutdown(beast::bind_front_handler(&https_logic<Body>::on_shutdown,this->shared_from_this()));
 			}
 		}
