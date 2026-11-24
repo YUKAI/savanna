@@ -338,6 +338,22 @@ namespace ssl_reuse
 		{
 			ssl_cache_ = ssl_cache;
 		}
+		// The streams and the resolver are registered with ctx_'s reactor, and the
+		// http/https logic objects keep their own references to the streams. With the
+		// default member-wise destruction ctx_ (declared after the logic members) is
+		// released first, so the io_context is freed while the streams are still alive,
+		// and closing their sockets later touches the freed reactor (use-after-free).
+		// Release everything that uses ctx_ first, then ctx_ itself.
+		~reuse_async_request_executor()
+		{
+			logic = nullptr;
+			http_logic_ = nullptr;
+			https_logic_ = nullptr;
+			ssl_stream_ = nullptr;
+			tcp_stream_ = nullptr;
+			resolver_ = nullptr;
+			ctx_ = nullptr;
+		}
 		bool send(savanna::ssl_reuse::request original_request, std::function<void(savanna::result<http::response<Body>>)> completion)
 		{
 			if(isReady_) {
